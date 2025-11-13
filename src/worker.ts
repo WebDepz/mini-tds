@@ -1,413 +1,299 @@
-interface RouteMatchConfig {
-  path?: string[];
-  countries?: string[];
-  devices?: Array<"mobile" | "desktop">;
-}
+// src/worker.ts
+// Мини-TDS на Cloudflare Workers с точным определением mobile и поисковых ботов.
+// Поддерживает конфиг в формате config/routes.json, импортируемый на этапе сборки.
 
-interface RouteConfig {
-  id: string;
-  match?: RouteMatchConfig;
-  target: string;
-  stripPathPrefix?: string;
-  appendPath?: boolean;
-  forwardQuery?: boolean;
-  extraParams?: Record<string, string>;
-  status?: number;
-}
+import ROUTES from "../config/routes.json" assert { type: "json" };
 
-interface SeoConfig {
-  uaAllowList?: string[];
-  respectNoArchive?: boolean;
-}
+/** ----------------------------- Типы конфига ----------------------------- */
 
-interface PerfConfig {
-  configTtlSeconds?: number;
-  logSampleRate?: number;
-}
+type Device = "mobile" | "desktop" | "tablet" | "any";
 
-interface FilterConfig {
-  botUserAgentPattern?: string;
-  botAsnList?: number[];
-  mobileUserAgentPattern?: string;
-}
+type MatchRule = {
+  path?: string[];                 // Простейшие шаблоны: '/casino/*', '/go/*'
+  pattern?: string[];              // RegExp-строки для pathname (без флагов /.../)
+  countries?: string[];            // ISO-3166-1 alpha-2, напр. ["RU","BY"]
+  devices?: Device[];              // ["mobile"], ["desktop"], ["mobile","tablet"], ...
+  bot?: boolean;                   // true = только боты, false = исключать ботов, undefined = не важно
+};
 
-interface FallbackConfig {
-  status?: number;
-  body?: string;
-  headers?: Record<string, string>;
-}
+type RouteRule = {
+  id?: string;
+  match: MatchRule;
+  target: string;                  // База redirect-а, напр. 'https://2win.click/tds/go.cgi?4'
+  status?: number;                 // 301/302 и т.п. По умолчанию 302
+  forwardQuery?: boolean;          // Протянуть оригинальные query-параметры
+  appendPath?: boolean;            // Приклеить оригинальный path к target
+  extraParams?: Record<string, unknown>; // Доп.параметры ?k=v
+  trackingParam?: string;          // Доп. utm/src параметр
+  trackingValue?: string;          // Значение для trackingParam
+};
 
-interface RoutesConfig {
-  routes: RouteConfig[];
-  fallback?: FallbackConfig;
-  seo?: SeoConfig;
-  perf?: PerfConfig;
-  filters?: FilterConfig;
-}
-
-interface Env {
-  CONFIG: KVNamespace;
-}
-
-type CfRequest = Request & {
-  cf?: {
-    country?: string;
-    asn?: number;
+type FallbackConfig = {
+  response?: {
+    status?: number;
+    headers?: Record<string, string>;
+    body?: string;
   };
 };
 
-const DEFAULT_CONFIG_KEY = "routes.json";
-const DEFAULT_TTL_SECONDS = 60;
+type RoutesConfig = {
+  rules: RouteRule[];
+  fallback?: FallbackConfig;
+};
 
-const DEFAULT_BOT_USER_AGENT_PATTERN =
-  "\\b(?:adsbot-google(?:-mobile)?|mediapartners-google|feedfetcher-google|googlebot(?:[-_ ]?(?:image|video|news|mobile))?|google(?: web)?preview|bingbot|msnbot|bingpreview|yandex(?:bot|images|direct|video|mobilebot)?|baiduspider|slurp|duckduckbot|mail\\.ru_bot|applebot|petalbot|facebookexternalhit|twitterbot|discordbot|telegrambot|slackbot|linkedinbot)\\b";
-const DEFAULT_BOT_USER_AGENT_REGEX = new RegExp(DEFAULT_BOT_USER_AGENT_PATTERN, "i");
-const DEFAULT_BOT_ASN_SET = new Set([15169, 8075, 13238, 32934, 16509, 14618]);
-const DEFAULT_MOBILE_USER_AGENT_PATTERN =
-  "\\b(android|iphone|ipod|windows phone|opera mini|opera mobi|blackberry|bb10|silk/|kindle|webos|iemobile|samsungbrowser|miuibrowser|miui|huawei|oppo|oneplus|vivo|realme|poco|ucbrowser|crios|fxios|edgios)\\b";
-const DEFAULT_MOBILE_USER_AGENT_REGEX = new RegExp(DEFAULT_MOBILE_USER_AGENT_PATTERN, "i");
+/** ----------------------------- Утилиты UA/боты ----------------------------- */
 
-const botUaRegexCache = new WeakMap<RoutesConfig, RegExp>();
-const mobileUaRegexCache = new WeakMap<RoutesConfig, RegExp>();
-const botAsnSetCache = new WeakMap<RoutesConfig, Set<number>>();
-
-let cachedConfig: RoutesConfig | null = null;
-let cacheExpiresAt = 0;
-
-async function loadConfig(env: Env): Promise<RoutesConfig | null> {
-  const now = Date.now();
-  if (cachedConfig && now < cacheExpiresAt) {
-    return cachedConfig;
-  }
-
-  try {
-    const raw = await env.CONFIG.get(DEFAULT_CONFIG_KEY, "text");
-    if (!raw) {
-      console.error("[tds] Config not found in KV");
-      return cachedConfig;
-    }
-    const parsed = JSON.parse(raw) as RoutesConfig;
-    cachedConfig = parsed;
-    const ttl = parsed.perf?.configTtlSeconds ?? DEFAULT_TTL_SECONDS;
-    cacheExpiresAt = now + ttl * 1000;
-    return parsed;
-  } catch (error) {
-    console.error("[tds] Failed to load config", error);
-    return cachedConfig;
-  }
+// Корректное определение поисковых ботов (whitelist — не редиректим).
+function isSearchBot(uaRaw: string): boolean {
+  const ua = (uaRaw || "").toLowerCase();
+  const bots = [
+    "yandexbot",
+    "yandexmobilebot",
+    "yandeximages",
+    "yandexvideo",
+    "yandexnews",
+    "yandexwebmaster",
+    "googlebot",
+    "google-structured-data-testing-tool",
+    "bingbot",
+    "msnbot",
+    "bingpreview",
+    "duckduckbot",
+    "baiduspider",
+    "sogou",
+    "exabot",
+    "mj12bot",
+    "semrushbot",
+  ];
+  return bots.some((sig) => ua.includes(sig));
 }
 
-function getBotUserAgentRegex(config: RoutesConfig): RegExp {
-  const cached = botUaRegexCache.get(config);
-  if (cached) {
-    return cached;
-  }
-  const pattern = config.filters?.botUserAgentPattern;
-  if (pattern) {
-    try {
-      const compiled = new RegExp(pattern, "i");
-      botUaRegexCache.set(config, compiled);
-      return compiled;
-    } catch (error) {
-      console.error("[tds] Invalid bot user agent pattern", { pattern, error });
-    }
-  }
-  botUaRegexCache.set(config, DEFAULT_BOT_USER_AGENT_REGEX);
-  return DEFAULT_BOT_USER_AGENT_REGEX;
-}
+// Мобильные устройства: телефоны iOS/Android/Windows Phone, исключаем планшеты.
+function isMobileUA(uaRaw: string): boolean {
+  if (!uaRaw) return false;
+  const ua = uaRaw.toLowerCase();
 
-function getMobileUserAgentRegex(config: RoutesConfig): RegExp {
-  const cached = mobileUaRegexCache.get(config);
-  if (cached) {
-    return cached;
-  }
-  const pattern = config.filters?.mobileUserAgentPattern;
-  if (pattern) {
-    try {
-      const compiled = new RegExp(pattern, "i");
-      mobileUaRegexCache.set(config, compiled);
-      return compiled;
-    } catch (error) {
-      console.error("[tds] Invalid mobile user agent pattern", { pattern, error });
-    }
-  }
-  mobileUaRegexCache.set(config, DEFAULT_MOBILE_USER_AGENT_REGEX);
-  return DEFAULT_MOBILE_USER_AGENT_REGEX;
-}
+  // Явные мобилки
+  if (/(iphone|ipod|windows phone|iemobile|blackberry|opera mini)/i.test(uaRaw)) return true;
 
-function getBotAsnSet(config: RoutesConfig): Set<number> {
-  const cached = botAsnSetCache.get(config);
-  if (cached) {
-    return cached;
-  }
-  const list = config.filters?.botAsnList;
-  if (list && Array.isArray(list) && list.length > 0) {
-    const compiled = new Set(list);
-    botAsnSetCache.set(config, compiled);
-    return compiled;
-  }
-  botAsnSetCache.set(config, DEFAULT_BOT_ASN_SET);
-  return DEFAULT_BOT_ASN_SET;
-}
-
-function isSeoUserAgent(userAgent: string | null, config: RoutesConfig): boolean {
-  if (!userAgent) {
-    return false;
-  }
-  const allowList = config.seo?.uaAllowList;
-  if (!allowList || allowList.length === 0) {
-    return false;
-  }
-  const loweredAgent = userAgent.toLowerCase();
-  return allowList.some((needle) => loweredAgent.includes(needle.toLowerCase()));
-}
-
-function classifyDevice(request: Request, config: RoutesConfig): "mobile" | "desktop" {
-  const chMobile = request.headers.get("Sec-CH-UA-Mobile");
-  if (chMobile) {
-    const normalized = chMobile.trim();
-    if (normalized === "?1" || normalized === "1") {
-      return "mobile";
-    }
-    if (normalized === "?0" || normalized === "0") {
-      return "desktop";
-    }
+  // Android: у телефонов почти всегда присутствует "Mobile", у планшетов — нет
+  if (ua.includes("android")) {
+    return ua.includes("mobile");
   }
 
-  const userAgent = request.headers.get("User-Agent") ?? "";
-  if (!userAgent) {
-    return "desktop";
-  }
+  // Общий маркер mobile (iOS Safari и др.)
+  if (/\bmobile\b/i.test(uaRaw)) return true;
 
-  const negativeRegex = /(iPad|Tablet|X11|Macintosh(?!.*iPhone))/i;
-  if (negativeRegex.test(userAgent)) {
-    return "desktop";
-  }
-
-  if (/\bMobile\b/i.test(userAgent)) {
-    return "mobile";
-  }
-
-  const mobileRegex = getMobileUserAgentRegex(config);
-  return mobileRegex.test(userAgent) ? "mobile" : "desktop";
-}
-
-function isBotRequest(request: CfRequest, config: RoutesConfig): boolean {
-  const userAgent = request.headers.get("User-Agent");
-  if (userAgent && getBotUserAgentRegex(config).test(userAgent)) {
-    return true;
-  }
-
-  const asn = request.cf?.asn;
-  if (typeof asn === "number") {
-    const botAsn = getBotAsnSet(config);
-    if (botAsn.has(asn)) {
-      return true;
-    }
-  }
+  // Явные планшеты
+  if (ua.includes("ipad") || ua.includes("tablet")) return false;
 
   return false;
 }
 
-function getCountry(request: CfRequest): string | undefined {
-  const country = request.cf?.country;
-  if (!country) {
-    return undefined;
-  }
-  return country.toUpperCase();
+// Простейшее определение "tablet" (для полноты)
+function isTabletUA(uaRaw: string): boolean {
+  const ua = (uaRaw || "").toLowerCase();
+  if (ua.includes("ipad")) return true;
+  if (ua.includes("tablet")) return true;
+  // Android-планшеты: android без mobile — вероятно планшет
+  if (ua.includes("android") && !ua.includes("mobile")) return true;
+  return false;
 }
 
-function matchesCountry(match: RouteMatchConfig | undefined, country: string | undefined): boolean {
-  if (!match?.countries || match.countries.length === 0) {
-    return true;
+/** ----------------------------- Матчинг путей ----------------------------- */
+
+// Простая проверка '/prefix/*' и точное совпадение '/foo/bar'
+function matchPathSimple(pattern: string, pathname: string): boolean {
+  if (!pattern) return false;
+  if (pattern.endsWith("*")) {
+    const base = pattern.slice(0, -1); // '/casino/*' -> '/casino/'
+    return pathname.startsWith(base);
   }
-  if (!country) {
-    return false;
-  }
-  const upper = country.toUpperCase();
-  return match.countries.some((value) => value.toUpperCase() === upper);
+  return pathname === pattern;
 }
 
-function matchesDevice(match: RouteMatchConfig | undefined, device: "mobile" | "desktop"): boolean {
-  if (!match?.devices || match.devices.length === 0) {
-    return true;
-  }
-  return match.devices.includes(device);
-}
-
-function wildcardMatch(pattern: string, pathname: string): boolean {
-  const normalizedPattern = pattern.startsWith("/") ? pattern : `/${pattern}`;
-  if (normalizedPattern.endsWith("*")) {
-    const prefix = normalizedPattern.slice(0, -1);
-    return pathname.startsWith(prefix);
-  }
-  return pathname === normalizedPattern;
-}
-
-function matchesPath(match: RouteMatchConfig | undefined, pathname: string): boolean {
-  if (!match?.path || match.path.length === 0) {
-    return true;
-  }
-  return match.path.some((pattern) => wildcardMatch(pattern, pathname));
-}
-
-function decodeSlug(slug: string): string {
-  if (!slug) {
-    return slug;
-  }
-  return slug
-    .split("/")
-    .map((segment) => {
-      try {
-        return decodeURIComponent(segment);
-      } catch {
-        return segment;
-      }
-    })
-    .join("/");
-}
-
-function extractSlug(pathname: string, stripPathPrefix: string | undefined): string {
-  if (!stripPathPrefix) {
-    return "";
-  }
-
-  const normalizedPrefix = stripPathPrefix.startsWith("/")
-    ? stripPathPrefix
-    : `/${stripPathPrefix}`;
-  if (!pathname.startsWith(normalizedPrefix)) {
-    return "";
-  }
-
-  const raw = pathname.slice(normalizedPrefix.length);
-  const trimmed = raw.replace(/^\/+/, "").replace(/\/+$/, "");
-  return decodeSlug(trimmed);
-}
-
-function appendPathSegment(basePath: string, slug: string): string {
-  const sanitizedSlug = slug
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-  const trimmedBase = basePath.endsWith("/") ? basePath.slice(0, -1) : basePath;
-  if (trimmedBase === "" || trimmedBase === "/") {
-    return `/${sanitizedSlug}`;
-  }
-  return `${trimmedBase}/${sanitizedSlug}`;
-}
-
-function buildRedirectUrl(
-  route: RouteConfig,
-  requestUrl: URL,
-  slug: string
-): string {
-  const url = new URL(route.target);
-
-  const shouldAppendPath = route.appendPath !== false;
-  if (shouldAppendPath && slug) {
-    url.pathname = appendPathSegment(url.pathname, slug);
-  } else if (!shouldAppendPath && route.stripPathPrefix && slug) {
-    url.searchParams.set("bonus", slug);
-  }
-
-  if (route.forwardQuery) {
-    requestUrl.searchParams.forEach((value, key) => {
-      url.searchParams.append(key, value);
-    });
-  }
-
-  if (route.extraParams) {
-    for (const [key, value] of Object.entries(route.extraParams)) {
-      url.searchParams.set(key, value);
+// Проверка регэксп-строк для pathname
+function matchRegExpStrings(patterns: string[] | undefined, pathname: string): boolean {
+  if (!patterns || patterns.length === 0) return true; // нет паттернов — не ограничиваем
+  return patterns.some((src) => {
+    try {
+      const re = new RegExp(src);
+      return re.test(pathname);
+    } catch {
+      return false;
     }
-  }
-
-  return url.toString();
+  });
 }
 
-function maybeLog(config: RoutesConfig, message: string, details: Record<string, unknown>): void {
-  const rate = config.perf?.logSampleRate ?? 0;
-  if (rate > 0 && Math.random() < rate) {
-    console.log(`[tds] ${message}`, details);
-  }
-}
-
-function findMatchingRoute(
-  config: RoutesConfig,
+// Главный матч по rule.match
+function matchRule(
+  rule: MatchRule,
   pathname: string,
-  country: string | undefined,
-  device: "mobile" | "desktop"
-): { route: RouteConfig; slug: string } | null {
-  for (const route of config.routes ?? []) {
-    if (!matchesCountry(route.match, country)) {
-      continue;
-    }
-    if (!matchesDevice(route.match, device)) {
-      continue;
-    }
-    if (!matchesPath(route.match, pathname)) {
-      continue;
-    }
-
-    const slug = extractSlug(pathname, route.stripPathPrefix);
-    return { route, slug };
+  country: string,
+  device: Device,
+  isBot: boolean
+): boolean {
+  // 1) path (шаблоны)
+  if (rule.path && rule.path.length > 0) {
+    const ok = rule.path.some((p) => matchPathSimple(p, pathname));
+    if (!ok) return false;
   }
-  return null;
+
+  // 2) pattern (RegExp-строки)
+  if (!matchRegExpStrings(rule.pattern, pathname)) return false;
+
+  // 3) страны
+  if (rule.countries && rule.countries.length > 0) {
+    const ok = rule.countries.includes(country);
+    if (!ok) return false;
+  }
+
+  // 4) устройcтва
+  if (rule.devices && rule.devices.length > 0 && !rule.devices.includes("any")) {
+    if (!rule.devices.includes(device)) return false;
+  }
+
+  // 5) боты/не боты
+  if (typeof rule.bot === "boolean") {
+    if (rule.bot === true && !isBot) return false;   // правило только для ботов
+    if (rule.bot === false && isBot) return false;   // правило исключает ботов
+  }
+
+  return true;
 }
 
-const worker: ExportedHandler<Env> = {
-  async fetch(request, env) {
-    const config = await loadConfig(env);
-    if (!config) {
-      return fetch(request);
+/** ----------------------------- Построение редиректа ----------------------------- */
+
+// Копируем Query из src → dst (без дубликатов)
+function copyQueryParams(from: URL, to: URL) {
+  for (const [k, v] of from.searchParams.entries()) {
+    to.searchParams.set(k, v);
+  }
+}
+
+// Приклеиваем path с учётом слешей
+function appendPath(base: URL, extraPath: string) {
+  if (!extraPath) return;
+  const joined =
+    base.pathname.endsWith("/") || extraPath.startsWith("/")
+      ? `${base.pathname}${extraPath}`
+      : `${base.pathname}/${extraPath}`;
+  base.pathname = joined;
+}
+
+// Перенос первого сегмента исходного пути в query параметр.
+// Пример: исходный path "/casino/888starz/..." + {stripPrefix:"/casino/", paramName:"bonus"}
+// → добавит ?bonus=888starz
+function applyPathToParam(
+  dstUrl: URL,
+  srcPath: string,
+  opts?: { stripPrefix?: string; paramName?: string }
+) {
+  const stripPrefix = opts?.stripPrefix || "";
+  const paramName = opts?.paramName || "";
+  if (!paramName) return;
+
+  let path = srcPath || "/";
+  if (stripPrefix && path.startsWith(stripPrefix)) {
+    path = path.slice(stripPrefix.length);
+  }
+  const seg = path.split("/").filter(Boolean)[0];
+  if (seg) {
+    dstUrl.searchParams.set(paramName, seg);
+  }
+}
+
+// Сборка итогового redirect-URL согласно правилу
+function buildRedirectUrl(rule: RouteRule, reqUrl: URL): URL {
+  const target = new URL(rule.target);
+
+  // 1) Приклеить оригинальный path
+  if (rule.appendPath) {
+    appendPath(target, reqUrl.pathname);
+  }
+
+  // 2) Протянуть оригинальные query-параметры
+  if (rule.forwardQuery) {
+    copyQueryParams(reqUrl, target);
+  }
+
+  // 3) Доп.параметры из extraParams (кроме служебных __*)
+  if (rule.extraParams) {
+    for (const [k, v] of Object.entries(rule.extraParams)) {
+      if (k.startsWith("__")) continue; // служебные ключи пропускаем
+      target.searchParams.set(k, String(v));
     }
+  }
 
-    const country = getCountry(request as CfRequest);
+  // 4) Новая фича: перенос сегмента пути в параметр (?bonus=SEGMENT)
+  //    Служебные ключи:
+  //    - __pathToParam: string (имя параметра, напр. "bonus")
+  //    - __stripPrefix: string (префикс, напр. "/casino/")
+  const pathToParam = (rule.extraParams?.["__pathToParam"] ?? "") as string;
+  if (pathToParam) {
+    const stripPrefix = (rule.extraParams?.["__stripPrefix"] ?? "") as string;
+    applyPathToParam(target, reqUrl.pathname, {
+      stripPrefix,
+      paramName: pathToParam,
+    });
+  }
 
-    const device = classifyDevice(request, config);
+  // 5) Трекинг
+  if (rule.trackingParam && rule.trackingValue) {
+    target.searchParams.set(rule.trackingParam, rule.trackingValue);
+  }
 
-    if (isBotRequest(request as CfRequest, config)) {
-      return fetch(request);
-    }
+  return target;
+}
 
-    const userAgent = request.headers.get("User-Agent");
-    if (isSeoUserAgent(userAgent, config)) {
-      return fetch(request);
-    }
+/** ----------------------------- Ответ по умолчанию ----------------------------- */
 
-    const requestUrl = new URL(request.url);
-    const pathname = requestUrl.pathname;
-    const match = findMatchingRoute(config, pathname, country, device);
-    if (!match) {
-      if (config.fallback) {
-        const fallbackHeaders = new Headers(config.fallback.headers);
-        if (!fallbackHeaders.has("Cache-Control")) {
-          fallbackHeaders.set("Cache-Control", "no-store");
-        }
-        return new Response(config.fallback.body ?? "Not matched", {
-          status: config.fallback.status ?? 404,
-          headers: fallbackHeaders,
-        });
+function fallbackResponse(cfg?: FallbackConfig): Response {
+  const st = cfg?.response?.status ?? 204;
+  const body = cfg?.response?.body ?? "";
+  const headers = new Headers(cfg?.response?.headers ?? {});
+  return new Response(body, { status: st, headers });
+}
+
+/** ----------------------------- Worker ----------------------------- */
+
+export default {
+  async fetch(request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> {
+    const cfg = (ROUTES as RoutesConfig) || { rules: [] };
+
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+
+    const ua = request.headers.get("user-agent") || "";
+
+    const bot = isSearchBot(ua);
+
+    // Страна из CF (если нет — пустая строка)
+    const country = ((request as any).cf?.country || "").toUpperCase();
+
+    // Определяем device
+    let device: Device = "desktop";
+    if (isTabletUA(ua)) device = "tablet";
+    else if (isMobileUA(ua)) device = "mobile";
+
+    // Пытаемся найти первое подходящее правило
+    const rule = cfg.rules.find((r) => {
+      try {
+        return matchRule(r.match || {}, pathname, country, device, bot);
+      } catch {
+        return false;
       }
-      return fetch(request);
-    }
-
-    const redirectUrl = buildRedirectUrl(match.route, requestUrl, match.slug);
-
-    maybeLog(config, "redirect", {
-      country,
-      device,
-      routeId: match.route.id,
-      slug: match.slug,
-      target: redirectUrl,
-      path: pathname,
     });
 
-    const status = match.route.status ?? 302;
-    const response = Response.redirect(redirectUrl, status);
-    response.headers.set("Cache-Control", "no-store");
-    return response;
+    if (!rule) {
+      // Правило не найдено — отдаём fallback
+      return fallbackResponse(cfg.fallback);
+    }
+
+    // Если это правило вообще про редирект — собираем URL и редиректим
+    const redirectUrl = buildRedirectUrl(rule, url);
+    const code = rule.status ?? 302;
+
+    return Response.redirect(redirectUrl.toString(), code);
   },
 };
-
-export default worker;
