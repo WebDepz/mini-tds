@@ -2,10 +2,6 @@ name = "mini-tds"
 main = "src/worker.ts"
 compatibility_date = "2024-11-01"
 
-account_id = "REPLACE_WITH_ACCOUNT_ID"
-zone_id = "REPLACE_WITH_ZONE_ID"
-workers_dev = false
-
 routes = [
   { pattern = "bookieranks.ru/*", zone_name = "bookieranks.ru" }
 ]
