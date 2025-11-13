@@ -1,8 +1,11 @@
 name = "mini-tds"
 main = "src/worker.ts"
-compatibility_date = "2024-04-30"
+compatibility_date = "2024-11-01"
 
-[[kv_namespaces]]
-binding = "CONFIG"  # <--- ⚠️ именно CONFIG, не KV
-id = "a7ef054cee4b435f996060e458f7beef"
-preview_id = ""
+routes = [
+  { pattern = "bookieranks.ru/*", zone_name = "bookieranks.ru" }
+]
+
+kv_namespaces = [
+  { binding = "KV", id = "a7ef054cee4b435f996060e458f7beef" }
+]
