@@ -19,11 +19,5 @@
       "trackingParam": "src",
       "trackingValue": "mobile-geo"
     }
-  ],
-  "fallback": {
-    "response": {
-      "status": 204,
-      "body": ""
-    }
-  }
+  ]
 }
