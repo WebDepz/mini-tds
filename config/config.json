@@ -1,0 +1,30 @@
+{
+  "countryAllowList": ["RU"],
+  "pathRules": [
+    {
+      "pattern": "^/casino/([^/?#]+)",
+      "paramFromGroup": 1,
+      "target": {
+        "type": "query",
+        "base": "https://2win.click/tds/go.cgi?4",
+        "queryParam": "bonus"
+      }
+    }
+  ],
+  "redirect": {
+    "statusCode": 302,
+    "preserveOriginalQuery": true,
+    "extraQuery": {
+      "src": "tds-mobile-ru"
+    },
+    "appendCountry": false,
+    "appendDevice": false
+  },
+  "seo": {
+    "uaAllowList": ["Googlebot", "Yandex", "bingbot", "DuckDuckBot"]
+  },
+  "perf": {
+    "configTtlSeconds": 60,
+    "logSampleRate": 0.01
+  }
+}
