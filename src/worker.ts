@@ -1,49 +1,34 @@
 // src/worker.ts
-// Мини-TDS на Cloudflare Workers с точным определением mobile и поисковых ботов.
-// Поддерживает конфиг в формате config/routes.json, импортируемый на этапе сборки.
-
 import ROUTES from "../config/routes.json" assert { type: "json" };
 
-/** ----------------------------- Типы конфига ----------------------------- */
-
+/** ----------------------------- Типы ----------------------------- */
 type Device = "mobile" | "desktop" | "tablet" | "any";
 
 type MatchRule = {
-  path?: string[];                 // Простейшие шаблоны: '/casino/*', '/go/*'
-  pattern?: string[];              // RegExp-строки для pathname (без флагов /.../)
-  countries?: string[];            // ISO-3166-1 alpha-2, напр. ["RU","BY"]
-  devices?: Device[];              // ["mobile"], ["desktop"], ["mobile","tablet"], ...
-  bot?: boolean;                   // true = только боты, false = исключать ботов, undefined = не важно
+  path?: string[];
+  pattern?: string[];
+  countries?: string[];
+  devices?: Device[];
+  bot?: boolean;
 };
 
 type RouteRule = {
   id?: string;
   match: MatchRule;
-  target: string;                  // База redirect-а, напр. 'https://2win.click/tds/go.cgi?4'
-  status?: number;                 // 301/302 и т.п. По умолчанию 302
-  forwardQuery?: boolean;          // Протянуть оригинальные query-параметры
-  appendPath?: boolean;            // Приклеить оригинальный path к target
-  extraParams?: Record<string, unknown>; // Доп.параметры ?k=v
-  trackingParam?: string;          // Доп. utm/src параметр
-  trackingValue?: string;          // Значение для trackingParam
-};
-
-type FallbackConfig = {
-  response?: {
-    status?: number;
-    headers?: Record<string, string>;
-    body?: string;
-  };
+  target: string;
+  status?: number;
+  forwardQuery?: boolean;
+  appendPath?: boolean;
+  extraParams?: Record<string, unknown>;
+  trackingParam?: string;
+  trackingValue?: string;
 };
 
 type RoutesConfig = {
   rules: RouteRule[];
-  fallback?: FallbackConfig;
 };
 
-/** ----------------------------- Утилиты UA/боты ----------------------------- */
-
-// Корректное определение поисковых ботов (whitelist — не редиректим).
+/** ----------------------------- Детекторы ----------------------------- */
 function isSearchBot(uaRaw: string): boolean {
   const ua = (uaRaw || "").toLowerCase();
   const bots = [
@@ -65,44 +50,28 @@ function isSearchBot(uaRaw: string): boolean {
     "mj12bot",
     "semrushbot",
   ];
-  return bots.some((sig) => ua.includes(sig));
+  return bots.some(sig => ua.includes(sig));
 }
 
-// Мобильные устройства: телефоны iOS/Android/Windows Phone, исключаем планшеты.
-function isMobileUA(uaRaw: string): boolean {
-  if (!uaRaw) return false;
-  const ua = uaRaw.toLowerCase();
-
-  // Явные мобилки
-  if (/(iphone|ipod|windows phone|iemobile|blackberry|opera mini)/i.test(uaRaw)) return true;
-
-  // Android: у телефонов почти всегда присутствует "Mobile", у планшетов — нет
-  if (ua.includes("android")) {
-    return ua.includes("mobile");
-  }
-
-  // Общий маркер mobile (iOS Safari и др.)
-  if (/\bmobile\b/i.test(uaRaw)) return true;
-
-  // Явные планшеты
-  if (ua.includes("ipad") || ua.includes("tablet")) return false;
-
-  return false;
-}
-
-// Простейшее определение "tablet" (для полноты)
 function isTabletUA(uaRaw: string): boolean {
   const ua = (uaRaw || "").toLowerCase();
   if (ua.includes("ipad")) return true;
   if (ua.includes("tablet")) return true;
-  // Android-планшеты: android без mobile — вероятно планшет
   if (ua.includes("android") && !ua.includes("mobile")) return true;
   return false;
 }
 
-/** ----------------------------- Матчинг путей ----------------------------- */
+function isMobileUA(uaRaw: string): boolean {
+  if (!uaRaw) return false;
+  const ua = uaRaw.toLowerCase();
+  if (/(iphone|ipod|windows phone|iemobile|blackberry|opera mini)/i.test(uaRaw)) return true;
+  if (ua.includes("android")) return ua.includes("mobile");
+  if (/\bmobile\b/i.test(uaRaw)) return true;
+  if (ua.includes("ipad") || ua.includes("tablet")) return false;
+  return false;
+}
 
-// Простая проверка '/prefix/*' и точное совпадение '/foo/bar'
+/** ----------------------------- Матчинг путей ----------------------------- */
 function matchPathSimple(pattern: string, pathname: string): boolean {
   if (!pattern) return false;
   if (pattern.endsWith("*")) {
@@ -112,10 +81,9 @@ function matchPathSimple(pattern: string, pathname: string): boolean {
   return pathname === pattern;
 }
 
-// Проверка регэксп-строк для pathname
 function matchRegExpStrings(patterns: string[] | undefined, pathname: string): boolean {
-  if (!patterns || patterns.length === 0) return true; // нет паттернов — не ограничиваем
-  return patterns.some((src) => {
+  if (!patterns || patterns.length === 0) return true;
+  return patterns.some(src => {
     try {
       const re = new RegExp(src);
       return re.test(pathname);
@@ -125,7 +93,6 @@ function matchRegExpStrings(patterns: string[] | undefined, pathname: string): b
   });
 }
 
-// Главный матч по rule.match
 function matchRule(
   rule: MatchRule,
   pathname: string,
@@ -133,45 +100,32 @@ function matchRule(
   device: Device,
   isBot: boolean
 ): boolean {
-  // 1) path (шаблоны)
   if (rule.path && rule.path.length > 0) {
-    const ok = rule.path.some((p) => matchPathSimple(p, pathname));
+    const ok = rule.path.some(p => matchPathSimple(p, pathname));
     if (!ok) return false;
   }
-
-  // 2) pattern (RegExp-строки)
   if (!matchRegExpStrings(rule.pattern, pathname)) return false;
 
-  // 3) страны
   if (rule.countries && rule.countries.length > 0) {
-    const ok = rule.countries.includes(country);
-    if (!ok) return false;
+    if (!rule.countries.includes(country)) return false;
   }
-
-  // 4) устройcтва
   if (rule.devices && rule.devices.length > 0 && !rule.devices.includes("any")) {
     if (!rule.devices.includes(device)) return false;
   }
-
-  // 5) боты/не боты
   if (typeof rule.bot === "boolean") {
-    if (rule.bot === true && !isBot) return false;   // правило только для ботов
-    if (rule.bot === false && isBot) return false;   // правило исключает ботов
+    if (rule.bot === true && !isBot) return false;
+    if (rule.bot === false && isBot) return false;
   }
-
   return true;
 }
 
-/** ----------------------------- Построение редиректа ----------------------------- */
-
-// Копируем Query из src → dst (без дубликатов)
+/** ----------------------------- Сборка редиректа ----------------------------- */
 function copyQueryParams(from: URL, to: URL) {
   for (const [k, v] of from.searchParams.entries()) {
     to.searchParams.set(k, v);
   }
 }
 
-// Приклеиваем path с учётом слешей
 function appendPath(base: URL, extraPath: string) {
   if (!extraPath) return;
   const joined =
@@ -181,9 +135,6 @@ function appendPath(base: URL, extraPath: string) {
   base.pathname = joined;
 }
 
-// Перенос первого сегмента исходного пути в query параметр.
-// Пример: исходный path "/casino/888starz/..." + {stripPrefix:"/casino/", paramName:"bonus"}
-// → добавит ?bonus=888starz
 function applyPathToParam(
   dstUrl: URL,
   srcPath: string,
@@ -203,32 +154,21 @@ function applyPathToParam(
   }
 }
 
-// Сборка итогового redirect-URL согласно правилу
 function buildRedirectUrl(rule: RouteRule, reqUrl: URL): URL {
   const target = new URL(rule.target);
 
-  // 1) Приклеить оригинальный path
   if (rule.appendPath) {
     appendPath(target, reqUrl.pathname);
   }
-
-  // 2) Протянуть оригинальные query-параметры
   if (rule.forwardQuery) {
     copyQueryParams(reqUrl, target);
   }
-
-  // 3) Доп.параметры из extraParams (кроме служебных __*)
   if (rule.extraParams) {
     for (const [k, v] of Object.entries(rule.extraParams)) {
-      if (k.startsWith("__")) continue; // служебные ключи пропускаем
+      if (k.startsWith("__")) continue;
       target.searchParams.set(k, String(v));
     }
   }
-
-  // 4) Новая фича: перенос сегмента пути в параметр (?bonus=SEGMENT)
-  //    Служебные ключи:
-  //    - __pathToParam: string (имя параметра, напр. "bonus")
-  //    - __stripPrefix: string (префикс, напр. "/casino/")
   const pathToParam = (rule.extraParams?.["__pathToParam"] ?? "") as string;
   if (pathToParam) {
     const stripPrefix = (rule.extraParams?.["__stripPrefix"] ?? "") as string;
@@ -237,63 +177,63 @@ function buildRedirectUrl(rule: RouteRule, reqUrl: URL): URL {
       paramName: pathToParam,
     });
   }
-
-  // 5) Трекинг
   if (rule.trackingParam && rule.trackingValue) {
     target.searchParams.set(rule.trackingParam, rule.trackingValue);
   }
-
   return target;
 }
 
-/** ----------------------------- Ответ по умолчанию ----------------------------- */
-
-function fallbackResponse(cfg?: FallbackConfig): Response {
-  const st = cfg?.response?.status ?? 204;
-  const body = cfg?.response?.body ?? "";
-  const headers = new Headers(cfg?.response?.headers ?? {});
-  return new Response(body, { status: st, headers });
-}
-
 /** ----------------------------- Worker ----------------------------- */
-
 export default {
-  async fetch(request: Request, env: unknown, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request): Promise<Response> {
     const cfg = (ROUTES as RoutesConfig) || { rules: [] };
-
     const url = new URL(request.url);
     const pathname = url.pathname;
 
+    // 1) По умолчанию работаем ПРОЗРАЧНО: любые методы кроме GET — проксируем.
+    if (request.method !== "GET") {
+      return fetch(request);
+    }
+
     const ua = request.headers.get("user-agent") || "";
-
-    const bot = isSearchBot(ua);
-
-    // Страна из CF (если нет — пустая строка)
+    const isBot = isSearchBot(ua);
     const country = ((request as any).cf?.country || "").toUpperCase();
 
-    // Определяем device
     let device: Device = "desktop";
     if (isTabletUA(ua)) device = "tablet";
     else if (isMobileUA(ua)) device = "mobile";
 
-    // Пытаемся найти первое подходящее правило
-    const rule = cfg.rules.find((r) => {
+    // 2) Находим правило
+    const rule = cfg.rules.find(r => {
       try {
-        return matchRule(r.match || {}, pathname, country, device, bot);
+        return matchRule(r.match || {}, pathname, country, device, isBot);
       } catch {
         return false;
       }
     });
 
+    // 3) Если правило не найдено — проксируем на origin (НЕ 204!)
     if (!rule) {
-      // Правило не найдено — отдаём fallback
-      return fallbackResponse(cfg.fallback);
+      return fetch(request);
     }
 
-    // Если это правило вообще про редирект — собираем URL и редиректим
+    // 4) Доп. гарантия: если требуется параметр из пути — и сегмента нет, то не редиректим.
+    const needParam = (rule.extraParams?.["__pathToParam"] ?? "") as string;
+    if (needParam) {
+      const stripPrefix = (rule.extraParams?.["__stripPrefix"] ?? "") as string;
+      let path = pathname;
+      if (stripPrefix && path.startsWith(stripPrefix)) {
+        path = path.slice(stripPrefix.length);
+      }
+      const seg = path.split("/").filter(Boolean)[0];
+      if (!seg) {
+        return fetch(request);
+      }
+    }
+
+    // 5) Редирект
     const redirectUrl = buildRedirectUrl(rule, url);
     const code = rule.status ?? 302;
-
     return Response.redirect(redirectUrl.toString(), code);
   },
 };
