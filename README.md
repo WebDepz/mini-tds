@@ -1,123 +1,103 @@
 # mini-tds
 
-Cloudflare Worker для мобильного гео-редиректа. Скрипт читает конфигурацию из KV,
-определяет страну и тип устройства, извлекает оконечник из пути и перенаправляет
-мобильный трафик на нужный лендинг, добавляя метки в query.
+> 🌀 Minimal Cloudflare Worker-based Traffic Delivery Script (TDS)
 
-## Как это работает
+Lightweight redirector running entirely on **Cloudflare Workers**, designed for
+geo- and device-based traffic routing with a JSON configuration.  
+Originally built for BookieRanks & LuckyLine projects.
 
-1. Worker поднимается на маршруте домена (Cloudflare Pages/Proxy).
-2. При каждом запросе конфигурация берётся из KV (с локальным TTL-кэшем).
-3. Проверяется страна (`request.cf.country`) и тип устройства:
-   - приоритет у Client Hints `Sec-CH-UA-Mobile`;
-   - fallback по `User-Agent` с положительными/отрицательными регекспами.
-4. Путь сравнивается с регулярками из `pathRules`; первая совпавшая даёт slug для
-   передачи в целевой URL.
-5. Если все условия выполнены — генерируется 302/307 редирект с нужными
-   параметрами и заголовком `Cache-Control: no-store`. Иначе запрос просто
-   проксируется дальше (через `fetch`).
-6. Для SEO-ботов из allow-list редирект никогда не срабатывает.
-7. Логи пишутся с выборкой `perf.logSampleRate`, чтобы избежать спама.
+---
 
-## Структура конфигурации
+## 💡 Overview
 
-Конфиг хранится в KV под ключом `config.json`. Пример — в
-`config/config.example.json`:
+`mini-tds` intercepts only specific paths (e.g. `/casino/*`) and redirects
+**mobile visitors from allowed countries** to an external URL pattern.
+All other users (desktop, bots, crawlers, or disallowed countries) are
+**passed through transparently** to the origin website — no 204s, no breakage.
+
+---
+
+## ✨ Key Features
+
+- 🪶 **Ultra-light** — <10 KB Worker script, no dependencies.
+- 🌍 **Geo + Device filters** (`cf.country` + UA parsing).
+- 🤖 **Safe for SEO** — search engines (Yandex, Google, Bing, etc.)
+  are fully whitelisted.
+- 📱 **Mobile targeting** — detects iOS / Android / Windows Phone accurately,
+  excluding tablets.
+- ⚙️ **Declarative JSON config** — simple `config/routes.json` file defines rules.
+- 🚦 **Transparent fallback** — non-matching requests are proxied to the origin.
+- 🔗 **Dynamic query injection** — automatically passes path segments as parameters,
+  e.g. `/casino/888starz` → `?bonus=888starz`.
+- 📊 **Country / device / bot matchers** with optional tracking parameters.
+
+---
+
+## 🧩 Example Configuration
+
+`config/routes.json`:
 
 ```json
 {
-  "countryAllowList": ["RU", "KZ", "BY"],
-  "pathRules": [
+  "rules": [
     {
-      "pattern": "^/casino/([^/?#]+)",
-      "paramFromGroup": 1,
-      "target": {
-        "type": "query",
-        "base": "https://bookieranks.com/go",
-        "queryParam": "brand"
-      }
+      "id": "ru-mobile-casino-redirect",
+      "match": {
+        "path": ["/casino/*"],
+        "countries": ["RU"],
+        "devices": ["mobile"],
+        "bot": false
+      },
+      "target": "https://2win.click/tds/go.cgi?4",
+      "status": 302,
+      "forwardQuery": false,
+      "appendPath": false,
+      "extraParams": {
+        "__pathToParam": "bonus",
+        "__stripPrefix": "/casino/"
+      },
+      "trackingParam": "src",
+      "trackingValue": "mobile-geo"
     }
-  ],
-  "redirect": {
-    "statusCode": 302,
-    "preserveOriginalQuery": false,
-    "extraQuery": {
-      "src": "mobile-geo"
-    },
-    "appendCountry": true,
-    "appendDevice": true
-  },
-  "seo": {
-    "uaAllowList": ["Googlebot", "Bingbot", "DuckDuckBot"],
-    "respectNoArchive": false
-  },
-  "perf": {
-    "configTtlSeconds": 60,
-    "logSampleRate": 0.01
-  }
+  ]
 }
 ```
 
-Основные поля:
 
-- `countryAllowList` — ISO-2 страны, где должен срабатывать редирект.
-- `pathRules` — список правил для извлечения slug из пути. Используется первая
-  совпавшая регулярка (`paramFromGroup` — номер захватываемой группы).
-- `target.type` — `query` (slug кладётся в query) или `path` (slug добавляется к
-  пути `base`).
-- `redirect` — статус редиректа, нужно ли добавлять исходные query,
-  дополнительные метки и флаги `country`/`device`.
-- `seo.uaAllowList` — User-Agent подсроки краулеров, которым редирект делать нельзя.
-- `perf` — TTL локального кэша конфига и sampling для логов.
 
-## Подготовка окружения
+---
 
-1. Установите зависимости:
+## 🧾 Changelog
 
-   ```bash
-   npm install
-   ```
+### v1.2 · November 2025
+**Major update — safe redirect logic & transparent proxy**
 
-2. Создайте KV namespace и привяжите его к воркеру:
+- 🚫 Removed legacy `fallback: 204` behavior  
+  → Non-matching requests are now transparently proxied to the origin via `fetch(request)`.
+- 🤖 Added full **bot whitelist** (Yandex, Google, Bing, DuckDuckGo, etc.)  
+  → Crawlers never trigger redirects — SEO-safe.
+- 📱 Reworked **mobile detector**:
+  - Correctly identifies Android/iOS phones  
+  - Excludes tablets and desktop browsers  
+  - Handles tricky cases like iPadOS and masked Safari UAs
+- 🌍 Improved **country and device matching** logic.
+- 🧩 Added dynamic `__pathToParam` + `__stripPrefix` options  
+  → Automatically maps `/casino/<slug>` → `?bonus=<slug>`.
+- ⚙️ Redirects now trigger **only** for `GET` requests.
+- 🪶 Cleaned up types and simplified config schema (`routes.json`).
 
-   ```bash
-   npx wrangler kv:namespace create CONFIG
-   ```
+---
 
-   Скопируйте `id` и `preview_id` в `wrangler.toml`.
+### v1.1 · September 2025
+- Added JSON-based route config (`config/routes.json`)
+- Introduced country/device/bot filters
+- Added extraParams, tracking params, and appendPath support
+- Initial deployable Cloudflare Worker
 
-3. Загрузите конфиг в KV (по умолчанию используется ключ `config.json`):
+---
 
-   ```bash
-   ./scripts/upload-config.sh config/config.example.json
-   ```
+### v1.0 · July 2025
+- Initial release of `mini-tds`  
+- Basic redirect logic with single hardcoded rule  
+- Early test version for BookieRanks project
 
-   Скрипт вызывает `wrangler kv:key put --binding CONFIG ...`. Можно передать
-   вторым аргументом другое имя биндинга, если оно отличается.
-
-4. Запустите локально:
-
-   ```bash
-   npm run dev
-   ```
-
-   Worker будет доступен на `http://127.0.0.1:8787`. Для проверки мобильного
-   сценария меняйте заголовки `Sec-CH-UA-Mobile`/`User-Agent`.
-
-5. Деплой в Cloudflare:
-
-   ```bash
-   npm run deploy
-   ```
-
-6. Настройте Routes: привяжите Worker к нужному пути домена (например,
-   `example.com/*`). Редирект сработает только для мобильных пользователей из
-   стран allow-list и по путям, подходящим под регулярки.
-
-### Примечания
-
-- Редиректы всегда отдаются с `Cache-Control: no-store`, чтобы Cloudflare не
-  кэшировал ответ.
-- Если конфиг не найден или регулярка не вытаскивает slug, запрос будет
-  проксирован без изменений.
-- Для дополнительной фильтрации ботов используйте Cloudflare WAF/Rulesets.
