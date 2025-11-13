@@ -1,0 +1,9 @@
+name = "mini-tds"
+main = "src/worker.ts"
+compatibility_date = "2024-04-30"
+
+[[kv_namespaces]]
+binding = "CONFIG"
+# Заполните значениями namespace при инициализации
+id = "a7ef054cee4b435f996060e458f7beef"
+preview_id = ""
